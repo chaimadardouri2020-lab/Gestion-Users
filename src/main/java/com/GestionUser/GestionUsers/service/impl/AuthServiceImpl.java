@@ -1,235 +1,69 @@
-package com.app.service.impl;
-
-import com.app.dto.request.*;
-import com.app.dto.response.*;
-import com.app.entity.*;
-import com.app.enums.Role;
-import com.app.exception.*;
-import com.app.repository.*;
-import com.app.security.JwtService;
-import com.app.service.AuthService;
-import com.app.service.RefreshTokenService;
-import jakarta.servlet.http.HttpServletRequest;
+package com.GestionUser.GestionUsers.service.impl;
+import com.GestionUser.GestionUsers.dto.request.*;
+import com.GestionUser.GestionUsers.dto.response.*;
+import com.GestionUser.GestionUsers.entity.Role;
+import com.GestionUser.GestionUsers.entity.User;
+import com.GestionUser.GestionUsers.exception.EmailAlreadyExistsException;
+import com.GestionUser.GestionUsers.exception.InvalidTokenException;
+import com.GestionUser.GestionUsers.repository.RoleRepository;
+import com.GestionUser.GestionUsers.repository.UserRepository;
+import com.GestionUser.GestionUsers.security.JwtService;
+import com.GestionUser.GestionUsers.service.interfaces.IAuthService;
+import com.GestionUser.GestionUsers.service.interfaces.IHistoriqueService;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.security.authentication.*;
-import org.springframework.security.core.Authentication;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-
-import java.time.LocalDateTime;
-import java.util.concurrent.CompletableFuture;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-@Transactional
-public class AuthServiceImpl implements AuthService {
-
+import java.util.HashSet;
+import java.util.Set;
+@Service @RequiredArgsConstructor
+public class AuthServiceImpl implements IAuthService {
+    private static final Logger log = LoggerFactory.getLogger(AuthServiceImpl.class);
     private final UserRepository userRepository;
-    private final RefreshTokenService refreshTokenService;
-    private final JwtService jwtService;
+    private final RoleRepository roleRepository;
     private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
     private final AuthenticationManager authenticationManager;
-    private final UserMapper userMapper;
-
-    @Value("${security.rate-limit.login-attempts}")
-    private int maxLoginAttempts;
-
-    @Value("${security.rate-limit.lockout-duration-minutes}")
-    private int lockoutDurationMinutes;
-
-    // ─── Register ────────────────────────────────────────────────────
-
-    @Override
-    public CompletableFuture<ApiResponse<AuthResponse>> register(
-        RegisterRequest request,
-        HttpServletRequest httpRequest
-    ) {
-        return CompletableFuture.supplyAsync(() -> {
-            // Uniqueness checks
-            if (userRepository.existsByEmail(request.email())) {
-                throw new ConflictException("Email already registered");
-            }
-            if (userRepository.existsByUsername(request.username())) {
-                throw new ConflictException("Username already taken");
-            }
-
-            User user = User.builder()
-                .username(request.username())
-                .email(request.email())
-                .password(passwordEncoder.encode(request.password()))
-                .firstName(request.firstName())
-                .lastName(request.lastName())
-                .role(request.role() != null ? request.role() : Role.ROLE_USER)
-                .passwordChangedAt(LocalDateTime.now())
-                .build();
-
-            user = userRepository.save(user);
-
-            String accessToken  = jwtService.generateAccessToken(user);
-            String refreshToken = refreshTokenService.createRefreshToken(
-                user, extractDeviceInfo(httpRequest), extractIpAddress(httpRequest)
-            );
-
-            log.info("User registered: {} ({})", user.getUsername(), user.getRole());
-            return ApiResponse.created(buildAuthResponse(accessToken, refreshToken, user));
+    private final IHistoriqueService historiqueService;
+    @Override @Transactional
+    public AuthResponse register(RegisterRequest req) {
+        if (userRepository.existsByEmail(req.email())) throw new EmailAlreadyExistsException(req.email());
+        String roleName = req.role().toUpperCase().startsWith("ROLE_") ? req.role().toUpperCase() : "ROLE_" + req.role().toUpperCase();
+        Role role = roleRepository.findByName(roleName).orElseGet(() -> {
+            Role r = new Role(roleName, "Auto-created role");
+            return roleRepository.save(r);
         });
-    }
-
-    // ─── Login ───────────────────────────────────────────────────────
-
-    @Override
-    public CompletableFuture<ApiResponse<AuthResponse>> login(
-        LoginRequest request,
-        HttpServletRequest httpRequest
-    ) {
-        return CompletableFuture.supplyAsync(() -> {
-            User user = userRepository
-                .findByUsernameOrEmail(request.usernameOrEmail(), request.usernameOrEmail())
-                .orElseThrow(() -> new UnauthorizedException("Invalid credentials"));
-
-            // Brute-force protection
-            checkAccountLock(user);
-
-            try {
-                Authentication auth = authenticationManager.authenticate(
-                    new UsernamePasswordAuthenticationToken(
-                        user.getUsername(), request.password()
-                    )
-                );
-
-                // Reset failed attempts on success
-                user.setFailedLoginAttempts(0);
-                user.setLastLogin(LocalDateTime.now());
-                userRepository.save(user);
-
-                String accessToken  = jwtService.generateAccessToken((User) auth.getPrincipal());
-                String refreshToken = refreshTokenService.createRefreshToken(
-                    user, extractDeviceInfo(httpRequest), extractIpAddress(httpRequest)
-                );
-
-                log.info("User logged in: {}", user.getUsername());
-                return ApiResponse.ok("Login successful",
-                    buildAuthResponse(accessToken, refreshToken, user));
-
-            } catch (BadCredentialsException ex) {
-                incrementFailedAttempts(user);
-                throw new UnauthorizedException("Invalid credentials");
-            }
-        });
-    }
-
-    // ─── Refresh Token ────────────────────────────────────────────────
-
-    @Override
-    public CompletableFuture<ApiResponse<TokenRefreshResponse>> refreshToken(
-        RefreshTokenRequest request
-    ) {
-        return CompletableFuture.supplyAsync(() -> {
-            RefreshToken refreshToken = refreshTokenService.verifyRefreshToken(request.refreshToken());
-            User user = refreshToken.getUser();
-
-            String newAccessToken = jwtService.generateAccessToken(user);
-            long expiresIn = jwtService.getAccessTokenExpiration();
-
-            return ApiResponse.ok(TokenRefreshResponse.of(newAccessToken, expiresIn));
-        });
-    }
-
-    // ─── Logout ──────────────────────────────────────────────────────
-
-    @Override
-    public CompletableFuture<ApiResponse<Void>> logout(String refreshToken) {
-        return CompletableFuture.supplyAsync(() -> {
-            refreshTokenService.revokeToken(refreshToken);
-            return ApiResponse.<Void>ok("Logged out successfully", null);
-        });
-    }
-
-    // ─── Logout All Devices ──────────────────────────────────────────
-
-    @Override
-    public CompletableFuture<ApiResponse<Void>> logoutAll(String username) {
-        return CompletableFuture.supplyAsync(() -> {
-            userRepository.findByUsername(username)
-                .ifPresent(user -> refreshTokenService.revokeAllUserTokens(user));
-            return ApiResponse.<Void>ok("All sessions terminated", null);
-        });
-    }
-
-    // ─── Change Password ─────────────────────────────────────────────
-
-    @Override
-    public CompletableFuture<ApiResponse<Void>> changePassword(
-        String username,
-        ChangePasswordRequest request
-    ) {
-        return CompletableFuture.supplyAsync(() -> {
-            if (!request.newPassword().equals(request.confirmPassword())) {
-                throw new ValidationException("Passwords do not match");
-            }
-
-            User user = userRepository.findByUsername(username)
-                .orElseThrow(() -> new ResourceNotFoundException("User", "username", username));
-
-            if (!passwordEncoder.matches(request.currentPassword(), user.getPassword())) {
-                throw new UnauthorizedException("Current password is incorrect");
-            }
-
-            user.setPassword(passwordEncoder.encode(request.newPassword()));
-            user.setPasswordChangedAt(LocalDateTime.now());
-            userRepository.save(user);
-
-            // Revoke all refresh tokens to force re-login on other devices
-            refreshTokenService.revokeAllUserTokens(user);
-
-            return ApiResponse.<Void>ok("Password changed successfully", null);
-        });
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────
-
-    private void checkAccountLock(User user) {
-        if (!user.isAccountNonLocked()) {
-            LocalDateTime unlockTime = user.getLockTime().plusMinutes(lockoutDurationMinutes);
-            if (LocalDateTime.now().isBefore(unlockTime)) {
-                throw new AccountLockedException("Account locked. Try again after " + unlockTime);
-            }
-            // Auto-unlock
-            user.setAccountNonLocked(true);
-            user.setFailedLoginAttempts(0);
-            userRepository.save(user);
-        }
-    }
-
-    private void incrementFailedAttempts(User user) {
-        int attempts = user.getFailedLoginAttempts() + 1;
-        user.setFailedLoginAttempts(attempts);
-        if (attempts >= maxLoginAttempts) {
-            user.setAccountNonLocked(false);
-            user.setLockTime(LocalDateTime.now());
-            log.warn("Account locked after {} failed attempts: {}", attempts, user.getUsername());
-        }
+        Set<Role> roles = new HashSet<>();
+        roles.add(role);
+        User user = User.builder().firstName(req.firstName()).lastName(req.lastName())
+            .email(req.email()).password(passwordEncoder.encode(req.password()))
+            .roles(roles).build();
         userRepository.save(user);
+        historiqueService.log(user, "REGISTER", "Nouveau compte cree", null, "User", user.getId());
+        log.info("Registered: {}", user.getEmail());
+        return buildAuthResponse(user);
     }
-
-    private AuthResponse buildAuthResponse(String access, String refresh, User user) {
-        return AuthResponse.of(
-            access, refresh,
-            jwtService.getAccessTokenExpiration(),
-            userMapper.toResponse(user)
-        );
+    @Override @Transactional(readOnly = true)
+    public AuthResponse login(LoginRequest req) {
+        authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(req.email(), req.password()));
+        User user = userRepository.findByEmail(req.email()).orElseThrow(() -> new InvalidTokenException("User not found"));
+        historiqueService.log(user, "LOGIN", "Connexion reussie", null, "User", user.getId());
+        return buildAuthResponse(user);
     }
-
-    private String extractDeviceInfo(HttpServletRequest request) {
-        return request.getHeader("User-Agent");
+    @Override
+    public TokenRefreshResponse refreshToken(RefreshTokenRequest req) {
+        String username = jwtService.extractUsername(req.refreshToken());
+        User user = userRepository.findByEmail(username).orElseThrow(() -> new InvalidTokenException("Token invalide"));
+        if (!jwtService.isTokenValid(req.refreshToken(), user)) throw new InvalidTokenException("Token expire");
+        return new TokenRefreshResponse(jwtService.generateToken(user), req.refreshToken(), 3600000L);
     }
-
-    private String extractIpAddress(HttpServletRequest request) {
-        String xff = request.getHeader("X-Forwarded-For");
-        return xff != null ? xff.split(",")[0].trim() : request.getRemoteAddr();
+    @Override public void logout(String token) { log.info("Logout effectue"); }
+    private AuthResponse buildAuthResponse(User user) {
+        String role = user.getRoles().stream().findFirst().map(Role::getName).orElse("ROLE_USER");
+        return new AuthResponse(jwtService.generateToken(user), jwtService.generateRefreshToken(user), user.getEmail(), role, 3600000L);
     }
 }
